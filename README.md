@@ -19,11 +19,9 @@ All chat messages route through **imu** — StrawPot's self-operation agent. Ada
 ## Installation
 
 ```bash
-# Manual install (Phase 1)
-cp -r integrations/telegram ~/.strawpot/integrations/telegram
-cd ~/.strawpot/integrations/telegram && pip install -r requirements.txt
-
-# Future: strawhub install integration telegram
+strawhub install integration telegram
+strawhub install integration slack
+strawhub install integration discord
 ```
 
 Then configure and start from the StrawPot GUI **Integrations** page.

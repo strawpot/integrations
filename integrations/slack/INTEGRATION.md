@@ -45,17 +45,13 @@ are replied back in the thread.
    - `message.im` — direct messages
 6. Install the app to your workspace
 7. Copy the **Bot User OAuth Token** (`xoxb-...`) and **App-Level Token** (`xapp-...`)
-8. Install this integration and its dependencies:
+8. Install this integration:
    ```bash
-   cp -r integrations/slack ~/.strawpot/integrations/slack
-   cd ~/.strawpot/integrations/slack && pip install -r requirements.txt
+   strawhub install integration slack
    ```
 9. In the StrawPot GUI, go to **Integrations** → **slack** → **Configure**
 10. Paste both tokens and click Save
 11. Click **Start**
-
-> **Future:** `strawhub install integration slack` will handle step 8
-> automatically, including running the `install` command from the manifest.
 
 ## How it works
 
