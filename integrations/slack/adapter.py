@@ -32,6 +32,10 @@ APP_TOKEN = os.environ.get("STRAWPOT_APP_TOKEN", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 # How often to poll conversations for new sessions from other sources (seconds)
 CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
+# How often to poll for pending notifications to deliver (seconds)
+NOTIFY_POLL_INTERVAL = int(os.environ.get("NOTIFY_POLL_INTERVAL", "5"))
+# Integration name — must match INTEGRATION.md
+INTEGRATION_NAME = "slack"
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
@@ -285,6 +289,51 @@ def _run_conversation_poller() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Notification poller — delivers messages pushed via the notify API
+# ---------------------------------------------------------------------------
+
+
+def _run_notification_poller() -> None:
+    """Poll for pending notifications and deliver them to Slack channels."""
+    import time
+
+    while True:
+        try:
+            resp = httpx.get(
+                f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications",
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                for item in resp.json():
+                    chat_id = item.get("chat_id")
+                    message = item.get("message", "")
+                    nid = item["id"]
+                    if not chat_id:
+                        logger.warning("Notification %d has no chat_id, skipping", nid)
+                        continue
+                    try:
+                        for chunk in chunk_message(message):
+                            app.client.chat_postMessage(
+                                channel=chat_id,
+                                text=chunk,
+                            )
+                        # ACK after successful delivery
+                        httpx.post(
+                            f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
+                            f"/notifications/{nid}/ack",
+                            timeout=30,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to deliver notification %d to channel %s",
+                            nid, chat_id,
+                        )
+        except Exception:
+            logger.debug("Notification poller error")
+        time.sleep(NOTIFY_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Slack app setup
 # ---------------------------------------------------------------------------
 
@@ -432,12 +481,16 @@ def main() -> None:
     logger.info("Starting Slack adapter (Socket Mode)")
     logger.info("API URL: %s", API_URL)
 
-    # Start conversation poller in background thread
+    # Start background pollers in daemon threads
     poller_thread = threading.Thread(
         target=_run_conversation_poller, daemon=True
     )
     poller_thread.start()
-    logger.info("Conversation poller started")
+    notify_thread = threading.Thread(
+        target=_run_notification_poller, daemon=True
+    )
+    notify_thread.start()
+    logger.info("Conversation and notification pollers started")
 
     handler = SocketModeHandler(app, APP_TOKEN)
 

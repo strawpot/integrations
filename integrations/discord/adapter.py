@@ -32,6 +32,10 @@ DC_MAX_LEN = int(os.environ.get("DC_MAX_LEN", "1900"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 # How often to poll conversations for new sessions from other sources (seconds)
 CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
+# How often to poll for pending notifications to deliver (seconds)
+NOTIFY_POLL_INTERVAL = int(os.environ.get("NOTIFY_POLL_INTERVAL", "5"))
+# Integration name — must match INTEGRATION.md
+INTEGRATION_NAME = "discord"
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
@@ -291,6 +295,49 @@ async def conversation_poller() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Notification poller — delivers messages pushed via the notify API
+# ---------------------------------------------------------------------------
+
+
+async def notification_poller() -> None:
+    """Poll for pending notifications and deliver them to Discord channels."""
+    await bot.wait_until_ready()
+    async with httpx.AsyncClient(timeout=30) as client:
+        while not bot.is_closed():
+            try:
+                resp = await client.get(
+                    f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications"
+                )
+                if resp.status_code == 200:
+                    for item in resp.json():
+                        chat_id = item.get("chat_id")
+                        message = item.get("message", "")
+                        nid = item["id"]
+                        if not chat_id:
+                            logger.warning("Notification %d has no chat_id, skipping", nid)
+                            continue
+                        try:
+                            dest = bot.get_channel(int(chat_id))
+                            if dest is None:
+                                dest = await bot.fetch_channel(int(chat_id))
+                            for chunk_text in chunk_message(message):
+                                await dest.send(chunk_text)
+                            # ACK after successful delivery
+                            await client.post(
+                                f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
+                                f"/notifications/{nid}/ack"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to deliver notification %d to channel %s",
+                                nid, chat_id,
+                            )
+            except Exception:
+                logger.debug("Notification poller error")
+            await asyncio.sleep(NOTIFY_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Discord bot
 # ---------------------------------------------------------------------------
 
@@ -460,7 +507,8 @@ async def _handle_dm(message: discord.Message) -> None:
 async def on_ready():
     logger.info("Logged in as %s (ID: %s)", bot.user.name, bot.user.id)
     bot.loop.create_task(conversation_poller())
-    logger.info("Conversation poller started")
+    bot.loop.create_task(notification_poller())
+    logger.info("Conversation and notification pollers started")
 
 
 @bot.event
