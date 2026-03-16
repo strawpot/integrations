@@ -1,9 +1,11 @@
 """Telegram adapter for StrawPot — relays messages to/from imu."""
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -176,6 +178,49 @@ async def wait_for_session_poll(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def md_to_telegram_html(text: str) -> str:
+    """Convert common Markdown to Telegram-compatible HTML.
+
+    Handles: fenced code blocks, inline code, bold, italic, strikethrough,
+    and links.  Anything else passes through as plain text.
+    """
+    # Escape HTML entities first so user content is safe
+    text = html.escape(text)
+
+    # Fenced code blocks: ```lang\n...\n``` → <pre>...</pre>
+    text = re.sub(
+        r"```(?:\w*)\n(.*?)```",
+        lambda m: f"<pre>{m.group(1)}</pre>",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Inline code: `...` → <code>...</code>
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+
+    # Bold: **...** or __...__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+
+    # Italic: *...* or _..._  (but not inside words with underscores)
+    text = re.sub(r"(?<!\w)\*([^*]+?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_([^_]+?)_(?!\w)", r"<i>\1</i>", text)
+
+    # Strikethrough: ~~...~~
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+
+    # Links: [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Strip heading markers: ### Title → <b>Title</b>
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # Bullet lists: leading "- " or "* " → "• "
+    text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
+
+    return text
+
+
 def chunk_message(text: str) -> list[str]:
     """Split text into chunks that fit Telegram's message limit."""
     if len(text) <= TG_MAX_LEN:
@@ -269,8 +314,16 @@ async def handle_message(update: Update, context) -> None:
     except Exception:
         pass
 
-    for chunk in chunk_message(summary):
-        await update.message.reply_text(chunk)
+    html_summary = md_to_telegram_html(summary)
+    for chunk in chunk_message(html_summary):
+        try:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        except Exception:
+            # Fallback to plain text if HTML parsing fails
+            plain_chunk = chunk_message(summary)
+            for pc in plain_chunk:
+                await update.message.reply_text(pc)
+            break
 
 
 # ---------------------------------------------------------------------------
