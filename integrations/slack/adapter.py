@@ -30,6 +30,8 @@ API_URL = os.environ.get("STRAWPOT_API_URL", "http://127.0.0.1:52532")
 BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("STRAWPOT_APP_TOKEN", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
+# How often to poll conversations for new sessions from other sources (seconds)
+CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
@@ -54,13 +56,21 @@ def _init_db() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS thread_conversations (
-            channel_id  TEXT NOT NULL,
-            thread_ts   TEXT NOT NULL,
-            conv_id     INTEGER NOT NULL,
+            channel_id        TEXT NOT NULL,
+            thread_ts         TEXT NOT NULL,
+            conv_id           INTEGER NOT NULL,
+            last_session_id   TEXT,
             PRIMARY KEY (channel_id, thread_ts)
         )
         """
     )
+    # Migration: add last_session_id for existing databases
+    try:
+        conn.execute(
+            "ALTER TABLE thread_conversations ADD COLUMN last_session_id TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -83,6 +93,17 @@ def set_conv_id(channel_id: str, thread_ts: str, conv_id: int) -> None:
         db.execute(
             "INSERT OR REPLACE INTO thread_conversations (channel_id, thread_ts, conv_id) VALUES (?, ?, ?)",
             (channel_id, thread_ts, conv_id),
+        )
+        db.commit()
+
+
+def update_last_session_id(channel_id: str, thread_ts: str, run_id: str) -> None:
+    """Update the last seen session ID for a thread."""
+    with _db_lock:
+        db.execute(
+            "UPDATE thread_conversations SET last_session_id = ? "
+            "WHERE channel_id = ? AND thread_ts = ?",
+            (run_id, channel_id, thread_ts),
         )
         db.commit()
 
@@ -196,6 +217,74 @@ def chunk_message(text: str, max_len: int = 39_000) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Conversation poller — detects sessions from other sources (scheduler, GUI)
+# ---------------------------------------------------------------------------
+
+
+def _run_conversation_poller() -> None:
+    """Poll watched conversations and relay new completed sessions to Slack."""
+    import time
+
+    while True:
+        try:
+            with _db_lock:
+                rows = db.execute(
+                    "SELECT channel_id, thread_ts, conv_id, last_session_id "
+                    "FROM thread_conversations"
+                ).fetchall()
+            for channel_id, thread_ts, conv_id, last_seen in rows:
+                try:
+                    resp = httpx.get(
+                        f"{API_URL}/api/conversations/{conv_id}", timeout=30
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    sessions = resp.json().get("sessions", [])
+                    if not sessions:
+                        continue
+
+                    # If no marker yet, initialize to latest without delivering
+                    if last_seen is None:
+                        update_last_session_id(
+                            channel_id, thread_ts, sessions[-1]["run_id"]
+                        )
+                        continue
+
+                    # Find new completed sessions after the marker
+                    found_marker = False
+                    for session in sessions:
+                        if not found_marker:
+                            if session["run_id"] == last_seen:
+                                found_marker = True
+                            continue
+                        if session["status"] in (
+                            "completed",
+                            "failed",
+                            "stopped",
+                        ):
+                            summary = (
+                                session.get("summary")
+                                or f"Session {session['status']}."
+                            )
+                            for chunk in chunk_message(summary):
+                                app.client.chat_postMessage(
+                                    channel=channel_id,
+                                    thread_ts=thread_ts
+                                    if thread_ts != "dm"
+                                    else None,
+                                    text=chunk,
+                                )
+                            update_last_session_id(
+                                channel_id, thread_ts, session["run_id"]
+                            )
+                except Exception:
+                    logger.debug("Poller error for conv %d", conv_id)
+        except Exception:
+            logger.exception("Conversation poller error")
+        time.sleep(CONV_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Slack app setup
 # ---------------------------------------------------------------------------
 
@@ -259,6 +348,9 @@ def handle_mention(event, say, context):
 
     for chunk in chunk_message(summary):
         say(text=chunk, thread_ts=thread_ts)
+
+    # Update marker so the conversation poller skips this session
+    update_last_session_id(channel, thread_ts, run_id)
 
 
 @app.event("message")
@@ -327,6 +419,9 @@ def handle_dm(event, say, context):
     for chunk in chunk_message(summary):
         say(text=chunk, channel=channel)
 
+    # Update marker so the conversation poller skips this session
+    update_last_session_id(channel, "dm", run_id)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -336,6 +431,13 @@ def handle_dm(event, say, context):
 def main() -> None:
     logger.info("Starting Slack adapter (Socket Mode)")
     logger.info("API URL: %s", API_URL)
+
+    # Start conversation poller in background thread
+    poller_thread = threading.Thread(
+        target=_run_conversation_poller, daemon=True
+    )
+    poller_thread.start()
+    logger.info("Conversation poller started")
 
     handler = SocketModeHandler(app, APP_TOKEN)
 
