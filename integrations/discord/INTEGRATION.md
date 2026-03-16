@@ -14,6 +14,9 @@ metadata:
       POLL_INTERVAL:
         required: false
         description: Session poll interval in seconds when WebSocket fails (default 3)
+      NOTIFY_POLL_INTERVAL:
+        required: false
+        description: Notification delivery poll interval in seconds (default 5)
       DC_MAX_LEN:
         required: false
         description: Max characters per Discord message (default 1900)

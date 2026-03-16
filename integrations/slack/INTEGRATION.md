@@ -17,6 +17,9 @@ metadata:
       POLL_INTERVAL:
         required: false
         description: Session poll interval in seconds when WebSocket fails (default 3)
+      NOTIFY_POLL_INTERVAL:
+        required: false
+        description: Notification delivery poll interval in seconds (default 5)
 ---
 
 # Slack Adapter
