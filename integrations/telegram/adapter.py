@@ -39,6 +39,8 @@ BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
 TG_MAX_LEN = int(os.environ.get("TG_MAX_LEN", "4000"))
 # How often to poll for session status if WebSocket fails (seconds)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
+# How often to poll conversations for new sessions from other sources (seconds)
+CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
@@ -60,11 +62,19 @@ def _init_db() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_conversations (
-            chat_id   TEXT PRIMARY KEY,
-            conv_id   INTEGER NOT NULL
+            chat_id           TEXT PRIMARY KEY,
+            conv_id           INTEGER NOT NULL,
+            last_session_id   TEXT
         )
         """
     )
+    # Migration: add last_session_id for existing databases
+    try:
+        conn.execute(
+            "ALTER TABLE chat_conversations ADD COLUMN last_session_id TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -84,6 +94,15 @@ def set_conv_id(chat_id: str, conv_id: int) -> None:
     db.execute(
         "INSERT OR REPLACE INTO chat_conversations (chat_id, conv_id) VALUES (?, ?)",
         (chat_id, conv_id),
+    )
+    db.commit()
+
+
+def update_last_session_id(chat_id: str, run_id: str) -> None:
+    """Update the last seen session ID for a chat."""
+    db.execute(
+        "UPDATE chat_conversations SET last_session_id = ? WHERE chat_id = ?",
+        (run_id, chat_id),
     )
     db.commit()
 
@@ -244,6 +263,79 @@ def chunk_message(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Conversation poller — detects sessions from other sources (scheduler, GUI)
+# ---------------------------------------------------------------------------
+
+
+async def conversation_poller(application) -> None:
+    """Poll watched conversations and relay new completed sessions to Telegram."""
+    bot_instance = application.bot
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            try:
+                rows = db.execute(
+                    "SELECT chat_id, conv_id, last_session_id "
+                    "FROM chat_conversations"
+                ).fetchall()
+                for chat_id, conv_id, last_seen in rows:
+                    try:
+                        resp = await client.get(
+                            f"{API_URL}/api/conversations/{conv_id}"
+                        )
+                        if resp.status_code != 200:
+                            continue
+                        sessions = resp.json().get("sessions", [])
+                        if not sessions:
+                            continue
+
+                        # If no marker yet, initialize to latest without delivering
+                        if last_seen is None:
+                            update_last_session_id(
+                                chat_id, sessions[-1]["run_id"]
+                            )
+                            continue
+
+                        # Find new completed sessions after the marker
+                        found_marker = False
+                        for session in sessions:
+                            if not found_marker:
+                                if session["run_id"] == last_seen:
+                                    found_marker = True
+                                continue
+                            if session["status"] in (
+                                "completed",
+                                "failed",
+                                "stopped",
+                            ):
+                                summary = (
+                                    session.get("summary")
+                                    or f"Session {session['status']}."
+                                )
+                                html_summary = md_to_telegram_html(summary)
+                                for chunk in chunk_message(html_summary):
+                                    try:
+                                        await bot_instance.send_message(
+                                            chat_id=int(chat_id),
+                                            text=chunk,
+                                            parse_mode=ParseMode.HTML,
+                                        )
+                                    except Exception:
+                                        await bot_instance.send_message(
+                                            chat_id=int(chat_id),
+                                            text=summary[:TG_MAX_LEN],
+                                        )
+                                        break
+                                update_last_session_id(
+                                    chat_id, session["run_id"]
+                                )
+                    except Exception:
+                        logger.debug("Poller error for conv %d", conv_id)
+            except Exception:
+                logger.exception("Conversation poller error")
+            await asyncio.sleep(CONV_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 
@@ -329,17 +421,26 @@ async def handle_message(update: Update, context) -> None:
                 await update.message.reply_text(pc)
             break
 
+    # Update marker so the conversation poller skips this session
+    update_last_session_id(chat_id, run_id)
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
+async def _post_init(application) -> None:
+    """Start the conversation poller after the bot initializes."""
+    asyncio.create_task(conversation_poller(application))
+    logger.info("Conversation poller started")
+
+
 def main() -> None:
     logger.info("Starting Telegram adapter")
     logger.info("API URL: %s", API_URL)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

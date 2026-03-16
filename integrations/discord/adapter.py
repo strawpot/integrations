@@ -30,6 +30,8 @@ BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
 DC_MAX_LEN = int(os.environ.get("DC_MAX_LEN", "1900"))
 # How often to poll for session status if WebSocket fails (seconds)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
+# How often to poll conversations for new sessions from other sources (seconds)
+CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
@@ -51,13 +53,21 @@ def _init_db() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS thread_conversations (
-            channel_id  TEXT NOT NULL,
-            thread_id   TEXT NOT NULL,
-            conv_id     INTEGER NOT NULL,
+            channel_id        TEXT NOT NULL,
+            thread_id         TEXT NOT NULL,
+            conv_id           INTEGER NOT NULL,
+            last_session_id   TEXT,
             PRIMARY KEY (channel_id, thread_id)
         )
         """
     )
+    # Migration: add last_session_id for existing databases
+    try:
+        conn.execute(
+            "ALTER TABLE thread_conversations ADD COLUMN last_session_id TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -77,6 +87,16 @@ def set_conv_id(channel_id: str, thread_id: str, conv_id: int) -> None:
     db.execute(
         "INSERT OR REPLACE INTO thread_conversations (channel_id, thread_id, conv_id) VALUES (?, ?, ?)",
         (channel_id, thread_id, conv_id),
+    )
+    db.commit()
+
+
+def update_last_session_id(channel_id: str, thread_id: str, run_id: str) -> None:
+    """Update the last seen session ID for a thread."""
+    db.execute(
+        "UPDATE thread_conversations SET last_session_id = ? "
+        "WHERE channel_id = ? AND thread_id = ?",
+        (run_id, channel_id, thread_id),
     )
     db.commit()
 
@@ -193,6 +213,84 @@ def chunk_message(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Conversation poller — detects sessions from other sources (scheduler, GUI)
+# ---------------------------------------------------------------------------
+
+
+async def conversation_poller() -> None:
+    """Poll watched conversations and relay new completed sessions to Discord."""
+    await bot.wait_until_ready()
+    async with httpx.AsyncClient(timeout=30) as client:
+        while not bot.is_closed():
+            try:
+                rows = db.execute(
+                    "SELECT channel_id, thread_id, conv_id, last_session_id "
+                    "FROM thread_conversations"
+                ).fetchall()
+                for channel_id, thread_id, conv_id, last_seen in rows:
+                    try:
+                        resp = await client.get(
+                            f"{API_URL}/api/conversations/{conv_id}"
+                        )
+                        if resp.status_code != 200:
+                            continue
+                        sessions = resp.json().get("sessions", [])
+                        if not sessions:
+                            continue
+
+                        # If no marker yet, initialize to latest without delivering
+                        if last_seen is None:
+                            update_last_session_id(
+                                channel_id, thread_id, sessions[-1]["run_id"]
+                            )
+                            continue
+
+                        # Find new completed sessions after the marker
+                        found_marker = False
+                        for session in sessions:
+                            if not found_marker:
+                                if session["run_id"] == last_seen:
+                                    found_marker = True
+                                continue
+                            if session["status"] in (
+                                "completed",
+                                "failed",
+                                "stopped",
+                            ):
+                                summary = (
+                                    session.get("summary")
+                                    or f"Session {session['status']}."
+                                )
+                                # Resolve destination channel/thread
+                                dest = None
+                                if thread_id == "dm":
+                                    dest = bot.get_channel(int(channel_id))
+                                else:
+                                    dest = bot.get_channel(int(thread_id))
+                                if dest is None:
+                                    try:
+                                        dest = await bot.fetch_channel(
+                                            int(thread_id)
+                                            if thread_id != "dm"
+                                            else int(channel_id)
+                                        )
+                                    except Exception:
+                                        continue
+                                for chunk_text in chunk_message(summary):
+                                    await dest.send(chunk_text)
+                                update_last_session_id(
+                                    channel_id,
+                                    thread_id,
+                                    session["run_id"],
+                                )
+                    except Exception:
+                        logger.debug("Poller error for conv %d", conv_id)
+            except Exception:
+                logger.exception("Conversation poller error")
+            await asyncio.sleep(CONV_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Discord bot
 # ---------------------------------------------------------------------------
 
@@ -253,6 +351,9 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
     for chunk in chunk_message(summary):
         await thread.send(chunk)
 
+    # Update marker so the conversation poller skips this session
+    update_last_session_id(channel_id, thread_id, run_id)
+
 
 async def _handle_thread_reply(message: discord.Message, text: str) -> None:
     """Handle reply in an existing thread — continue conversation."""
@@ -293,6 +394,9 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
 
     for chunk in chunk_message(summary):
         await thread.send(chunk)
+
+    # Update marker so the conversation poller skips this session
+    update_last_session_id(channel_id, thread_id, run_id)
 
 
 async def _handle_dm(message: discord.Message) -> None:
@@ -348,10 +452,15 @@ async def _handle_dm(message: discord.Message) -> None:
     for chunk in chunk_message(summary):
         await message.channel.send(chunk)
 
+    # Update marker so the conversation poller skips this session
+    update_last_session_id(channel_id, "dm", run_id)
+
 
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s (ID: %s)", bot.user.name, bot.user.id)
+    bot.loop.create_task(conversation_poller())
+    logger.info("Conversation poller started")
 
 
 @bot.event
