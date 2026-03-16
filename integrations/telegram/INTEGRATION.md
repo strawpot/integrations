@@ -4,7 +4,6 @@ description: Telegram bot adapter for StrawPot conversations
 metadata:
   strawpot:
     entry_point: python adapter.py
-    auto_start: false
     install:
       macos: pip install -r requirements.txt
       linux: pip install -r requirements.txt
@@ -12,9 +11,6 @@ metadata:
       STRAWPOT_BOT_TOKEN:
         required: true
         description: Telegram bot API token from @BotFather
-      STRAWPOT_API_URL:
-        required: false
-        description: StrawPot API URL (default http://127.0.0.1:52532, auto-set by GUI)
       TG_MAX_LEN:
         required: false
         description: Max characters per Telegram message (default 4000)

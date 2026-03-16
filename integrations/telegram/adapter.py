@@ -48,7 +48,11 @@ if not BOT_TOKEN:
 # Local database: chat_id → conversation_id mapping
 # ---------------------------------------------------------------------------
 
-_DB_PATH = Path(__file__).parent / ".adapter.db"
+# Persistent data directory provided by StrawPot GUI (survives reinstalls).
+# Falls back to current directory if not set (e.g. running standalone).
+_DATA_DIR = Path(os.environ.get("STRAWPOT_DATA_DIR") or str(Path(__file__).parent))
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+_DB_PATH = _DATA_DIR / "adapter.db"
 
 
 def _init_db() -> sqlite3.Connection:
