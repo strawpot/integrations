@@ -95,6 +95,15 @@ def set_conv_id(channel_id: str, thread_id: str, conv_id: int) -> None:
     db.commit()
 
 
+def clear_conv_id(channel_id: str, thread_id: str) -> None:
+    """Remove the conversation mapping for a thread (e.g. after deletion)."""
+    db.execute(
+        "DELETE FROM thread_conversations WHERE channel_id = ? AND thread_id = ?",
+        (channel_id, thread_id),
+    )
+    db.commit()
+
+
 def update_last_session_id(channel_id: str, thread_id: str, run_id: str) -> None:
     """Update the last seen session ID for a thread."""
     db.execute(
@@ -370,9 +379,20 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
         try:
             result = await submit_task(client, conv_id, text)
         except httpx.HTTPStatusError as exc:
-            logger.error("Task submission failed: %s", exc)
-            await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
-            return
+            if exc.response.status_code == 404:
+                logger.warning("Conversation %d deleted, creating new one for %s/%s", conv_id, channel_id, thread_id)
+                clear_conv_id(channel_id, thread_id)
+                conv_id = await get_or_create_conversation(client, channel_id, thread_id)
+                try:
+                    result = await submit_task(client, conv_id, text)
+                except httpx.HTTPStatusError as exc2:
+                    logger.error("Task submission failed after retry: %s", exc2)
+                    await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
+                    return
+            else:
+                logger.error("Task submission failed: %s", exc)
+                await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
+                return
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")
@@ -416,9 +436,20 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
         try:
             result = await submit_task(client, conv_id, text)
         except httpx.HTTPStatusError as exc:
-            logger.error("Task submission failed: %s", exc)
-            await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
-            return
+            if exc.response.status_code == 404:
+                logger.warning("Conversation %d deleted, creating new one for %s/%s", conv_id, channel_id, thread_id)
+                clear_conv_id(channel_id, thread_id)
+                conv_id = await get_or_create_conversation(client, channel_id, thread_id)
+                try:
+                    result = await submit_task(client, conv_id, text)
+                except httpx.HTTPStatusError as exc2:
+                    logger.error("Task submission failed after retry: %s", exc2)
+                    await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
+                    return
+            else:
+                logger.error("Task submission failed: %s", exc)
+                await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
+                return
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")
@@ -473,9 +504,20 @@ async def _handle_dm(message: discord.Message) -> None:
         try:
             result = await submit_task(client, conv_id, text)
         except httpx.HTTPStatusError as exc:
-            logger.error("Task submission failed: %s", exc)
-            await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
-            return
+            if exc.response.status_code == 404:
+                logger.warning("Conversation %d deleted, creating new one for %s/dm", conv_id, channel_id)
+                clear_conv_id(channel_id, "dm")
+                conv_id = await get_or_create_conversation(client, channel_id, "dm")
+                try:
+                    result = await submit_task(client, conv_id, text)
+                except httpx.HTTPStatusError as exc2:
+                    logger.error("Task submission failed after retry: %s", exc2)
+                    await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
+                    return
+            else:
+                logger.error("Task submission failed: %s", exc)
+                await ack.edit(content="Failed to submit task. Is StrawPot GUI running?")
+                return
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")

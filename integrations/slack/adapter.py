@@ -101,6 +101,16 @@ def set_conv_id(channel_id: str, thread_ts: str, conv_id: int) -> None:
         db.commit()
 
 
+def clear_conv_id(channel_id: str, thread_ts: str) -> None:
+    """Remove the conversation mapping for a thread (e.g. after deletion)."""
+    with _db_lock:
+        db.execute(
+            "DELETE FROM thread_conversations WHERE channel_id = ? AND thread_ts = ?",
+            (channel_id, thread_ts),
+        )
+        db.commit()
+
+
 def update_last_session_id(channel_id: str, thread_ts: str, run_id: str) -> None:
     """Update the last seen session ID for a thread."""
     with _db_lock:
@@ -367,9 +377,20 @@ def handle_mention(event, say, context):
     try:
         result = submit_task(conv_id, user_text)
     except httpx.HTTPStatusError as exc:
-        logger.error("Task submission failed: %s", exc)
-        say(text="Failed to submit task. Is StrawPot GUI running?", thread_ts=thread_ts)
-        return
+        if exc.response.status_code == 404:
+            logger.warning("Conversation %d deleted, creating new one for %s/%s", conv_id, channel, thread_ts)
+            clear_conv_id(channel, thread_ts)
+            conv_id = get_or_create_conversation(channel, thread_ts)
+            try:
+                result = submit_task(conv_id, user_text)
+            except httpx.HTTPStatusError as exc2:
+                logger.error("Task submission failed after retry: %s", exc2)
+                say(text="Failed to submit task. Is StrawPot GUI running?", thread_ts=thread_ts)
+                return
+        else:
+            logger.error("Task submission failed: %s", exc)
+            say(text="Failed to submit task. Is StrawPot GUI running?", thread_ts=thread_ts)
+            return
 
     if result.get("queued"):
         if ack_ts:
@@ -439,9 +460,20 @@ def handle_dm(event, say, context):
     try:
         result = submit_task(conv_id, text)
     except httpx.HTTPStatusError as exc:
-        logger.error("Task submission failed: %s", exc)
-        say(text="Failed to submit task. Is StrawPot GUI running?", channel=channel)
-        return
+        if exc.response.status_code == 404:
+            logger.warning("Conversation %d deleted, creating new one for %s/dm", conv_id, channel)
+            clear_conv_id(channel, "dm")
+            conv_id = get_or_create_conversation(channel, "dm")
+            try:
+                result = submit_task(conv_id, text)
+            except httpx.HTTPStatusError as exc2:
+                logger.error("Task submission failed after retry: %s", exc2)
+                say(text="Failed to submit task. Is StrawPot GUI running?", channel=channel)
+                return
+        else:
+            logger.error("Task submission failed: %s", exc)
+            say(text="Failed to submit task. Is StrawPot GUI running?", channel=channel)
+            return
 
     if result.get("queued"):
         if ack_ts:

@@ -102,6 +102,12 @@ def set_conv_id(chat_id: str, conv_id: int) -> None:
     db.commit()
 
 
+def clear_conv_id(chat_id: str) -> None:
+    """Remove the conversation mapping for a chat (e.g. after deletion)."""
+    db.execute("DELETE FROM chat_conversations WHERE chat_id = ?", (chat_id,))
+    db.commit()
+
+
 def update_last_session_id(chat_id: str, run_id: str) -> None:
     """Update the last seen session ID for a chat."""
     db.execute(
@@ -434,11 +440,25 @@ async def handle_message(update: Update, context) -> None:
         try:
             result = await submit_task(client, conv_id, text)
         except httpx.HTTPStatusError as exc:
-            logger.error("Task submission failed: %s", exc)
-            await update.message.reply_text(
-                "Failed to submit task. Is StrawPot GUI running?"
-            )
-            return
+            if exc.response.status_code == 404:
+                # Conversation was deleted — clear mapping and retry with a new one
+                logger.warning("Conversation %d deleted, creating new one for chat %s", conv_id, chat_id)
+                clear_conv_id(chat_id)
+                conv_id = await get_or_create_conversation(client, chat_id)
+                try:
+                    result = await submit_task(client, conv_id, text)
+                except httpx.HTTPStatusError as exc2:
+                    logger.error("Task submission failed after retry: %s", exc2)
+                    await update.message.reply_text(
+                        "Failed to submit task. Is StrawPot GUI running?"
+                    )
+                    return
+            else:
+                logger.error("Task submission failed: %s", exc)
+                await update.message.reply_text(
+                    "Failed to submit task. Is StrawPot GUI running?"
+                )
+                return
 
         if result.get("queued"):
             await update.message.reply_text(
