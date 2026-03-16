@@ -34,8 +34,8 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
 # How often to poll for pending notifications to deliver (seconds)
 NOTIFY_POLL_INTERVAL = int(os.environ.get("NOTIFY_POLL_INTERVAL", "5"))
-# Integration name — must match INTEGRATION.md
-INTEGRATION_NAME = "discord"
+# Integration name — passed by StrawPot GUI at launch
+INTEGRATION_NAME = os.environ.get("STRAWPOT_INTEGRATION_NAME", "discord")
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
