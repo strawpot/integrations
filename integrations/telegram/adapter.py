@@ -34,9 +34,9 @@ logger = logging.getLogger("strawpot.telegram")
 API_URL = os.environ.get("STRAWPOT_API_URL", "http://127.0.0.1:52532")
 BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
 # Max chars per Telegram message (leave room for formatting)
-TG_MAX_LEN = 4000
+TG_MAX_LEN = int(os.environ.get("TG_MAX_LEN", "4000"))
 # How often to poll for session status if WebSocket fails (seconds)
-POLL_INTERVAL = 3
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")

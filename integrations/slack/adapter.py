@@ -29,7 +29,7 @@ logger = logging.getLogger("strawpot.slack")
 API_URL = os.environ.get("STRAWPOT_API_URL", "http://127.0.0.1:52532")
 BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("STRAWPOT_APP_TOKEN", "")
-POLL_INTERVAL = 3
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
