@@ -14,6 +14,9 @@ metadata:
       POLL_INTERVAL:
         required: false
         description: Session poll interval in seconds when WebSocket fails (default 3)
+      CONV_POLL_INTERVAL:
+        required: false
+        description: Conversation poll interval in seconds for detecting new sessions (default 10)
       NOTIFY_POLL_INTERVAL:
         required: false
         description: Notification delivery poll interval in seconds (default 5)
