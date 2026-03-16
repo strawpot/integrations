@@ -4,7 +4,6 @@ description: Discord bot adapter for StrawPot conversations
 metadata:
   strawpot:
     entry_point: python adapter.py
-    auto_start: false
     install:
       macos: pip install -r requirements.txt
       linux: pip install -r requirements.txt
@@ -12,9 +11,6 @@ metadata:
       STRAWPOT_BOT_TOKEN:
         required: true
         description: Discord bot token from the Developer Portal
-      STRAWPOT_API_URL:
-        required: false
-        description: StrawPot API URL (default http://127.0.0.1:52532, auto-set by GUI)
       POLL_INTERVAL:
         required: false
         description: Session poll interval in seconds when WebSocket fails (default 3)

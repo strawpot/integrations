@@ -4,7 +4,6 @@ description: Slack bot adapter for StrawPot conversations via Socket Mode
 metadata:
   strawpot:
     entry_point: python adapter.py
-    auto_start: false
     install:
       macos: pip install -r requirements.txt
       linux: pip install -r requirements.txt
@@ -15,9 +14,6 @@ metadata:
       STRAWPOT_APP_TOKEN:
         required: true
         description: Slack App-Level Token for Socket Mode (xapp-...)
-      STRAWPOT_API_URL:
-        required: false
-        description: StrawPot API URL (default http://127.0.0.1:52532, auto-set by GUI)
       POLL_INTERVAL:
         required: false
         description: Session poll interval in seconds when WebSocket fails (default 3)
