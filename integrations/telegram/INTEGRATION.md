@@ -8,9 +8,8 @@ metadata:
     install:
       macos: pip install -r requirements.txt
       linux: pip install -r requirements.txt
-    config:
-      bot_token:
-        type: secret
+    env:
+      STRAWPOT_BOT_TOKEN:
         required: true
         description: Telegram bot API token from @BotFather
 ---
