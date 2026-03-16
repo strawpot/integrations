@@ -41,6 +41,10 @@ TG_MAX_LEN = int(os.environ.get("TG_MAX_LEN", "4000"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 # How often to poll conversations for new sessions from other sources (seconds)
 CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
+# How often to poll for pending notifications to deliver (seconds)
+NOTIFY_POLL_INTERVAL = int(os.environ.get("NOTIFY_POLL_INTERVAL", "5"))
+# Integration name — passed by StrawPot GUI at launch
+INTEGRATION_NAME = os.environ.get("STRAWPOT_INTEGRATION_NAME", "telegram")
 
 if not BOT_TOKEN:
     logger.error("STRAWPOT_BOT_TOKEN is not set")
@@ -336,6 +340,59 @@ async def conversation_poller(application) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Notification poller — delivers messages pushed via the notify API
+# ---------------------------------------------------------------------------
+
+
+async def notification_poller(application) -> None:
+    """Poll for pending notifications and deliver them to Telegram chats."""
+    bot_instance = application.bot
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            try:
+                resp = await client.get(
+                    f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications"
+                )
+                if resp.status_code == 200:
+                    for item in resp.json():
+                        chat_id = item.get("chat_id")
+                        message = item.get("message", "")
+                        nid = item["id"]
+                        if not chat_id:
+                            logger.warning("Notification %d has no chat_id, skipping", nid)
+                            continue
+                        try:
+                            html_msg = md_to_telegram_html(message)
+                            for chunk in chunk_message(html_msg):
+                                try:
+                                    await bot_instance.send_message(
+                                        chat_id=int(chat_id),
+                                        text=chunk,
+                                        parse_mode=ParseMode.HTML,
+                                    )
+                                except Exception:
+                                    # Fallback to plain text
+                                    await bot_instance.send_message(
+                                        chat_id=int(chat_id),
+                                        text=message[:TG_MAX_LEN],
+                                    )
+                                    break
+                            # ACK after successful delivery
+                            await client.post(
+                                f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
+                                f"/notifications/{nid}/ack"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to deliver notification %d to chat %s",
+                                nid, chat_id,
+                            )
+            except Exception:
+                logger.debug("Notification poller error")
+            await asyncio.sleep(NOTIFY_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 
@@ -431,9 +488,10 @@ async def handle_message(update: Update, context) -> None:
 
 
 async def _post_init(application) -> None:
-    """Start the conversation poller after the bot initializes."""
+    """Start background pollers after the bot initializes."""
     asyncio.create_task(conversation_poller(application))
-    logger.info("Conversation poller started")
+    asyncio.create_task(notification_poller(application))
+    logger.info("Conversation and notification pollers started")
 
 
 def main() -> None:
