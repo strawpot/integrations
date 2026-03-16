@@ -14,6 +14,7 @@ All chat messages route through **imu** — StrawPot's self-operation agent. Ada
 |-------------|-------------|
 | [telegram](integrations/telegram/) | Telegram bot adapter for StrawPot conversations |
 | [slack](integrations/slack/) | Slack bot adapter via Socket Mode |
+| [discord](integrations/discord/) | Discord bot adapter via Gateway WebSocket |
 
 ## Installation
 
