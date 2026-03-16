@@ -43,17 +43,13 @@ the thread.
    - Create Public Threads
    - Read Message History
 6. Use the generated URL to invite the bot to your server
-7. Install this integration and its dependencies:
+7. Install this integration:
    ```bash
-   cp -r integrations/discord ~/.strawpot/integrations/discord
-   cd ~/.strawpot/integrations/discord && pip install -r requirements.txt
+   strawhub install integration discord
    ```
 8. In the StrawPot GUI, go to **Integrations** → **discord** → **Configure**
 9. Paste the bot token and click Save
 10. Click **Start**
-
-> **Future:** `strawhub install integration discord` will handle step 7
-> automatically, including running the `install` command from the manifest.
 
 ## How it works
 

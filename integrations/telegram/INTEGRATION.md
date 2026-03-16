@@ -33,17 +33,13 @@ the chat.
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) on Telegram
 2. Copy the bot token
-3. Install this integration and its dependencies:
+3. Install this integration:
    ```bash
-   cp -r integrations/telegram ~/.strawpot/integrations/telegram
-   cd ~/.strawpot/integrations/telegram && pip install -r requirements.txt
+   strawhub install integration telegram
    ```
 4. In the StrawPot GUI, go to **Integrations** → **telegram** → **Configure**
 5. Paste the bot token and click Save
 6. Click **Start**
-
-> **Future:** `strawhub install integration telegram` will handle step 3
-> automatically, including running the `install` command from the manifest.
 
 ## How it works
 
