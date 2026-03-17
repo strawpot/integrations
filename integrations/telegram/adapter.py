@@ -477,6 +477,9 @@ async def handle_message(update: Update, context) -> None:
     # Wait for session to complete
     await wait_for_session_ws(run_id)
 
+    # Update marker immediately so the conversation poller skips this session
+    update_last_session_id(chat_id, run_id)
+
     # Fetch and send the summary
     async with httpx.AsyncClient(timeout=30) as client:
         summary = await get_session_summary(client, conv_id, run_id)
@@ -498,8 +501,6 @@ async def handle_message(update: Update, context) -> None:
                 await update.message.reply_text(pc)
             break
 
-    # Update marker so the conversation poller skips this session
-    update_last_session_id(chat_id, run_id)
 
 
 # ---------------------------------------------------------------------------
