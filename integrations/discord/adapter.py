@@ -406,6 +406,9 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
     # Wait for session to complete
     await wait_for_session_ws(run_id)
 
+    # Update marker immediately so the conversation poller skips this session
+    update_last_session_id(channel_id, thread_id, run_id)
+
     async with httpx.AsyncClient(timeout=30) as client:
         summary = await get_session_summary(client, conv_id, run_id)
 
@@ -417,9 +420,6 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
 
     for chunk in chunk_message(summary):
         await thread.send(chunk)
-
-    # Update marker so the conversation poller skips this session
-    update_last_session_id(channel_id, thread_id, run_id)
 
 
 async def _handle_thread_reply(message: discord.Message, text: str) -> None:
@@ -462,6 +462,9 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
 
     await wait_for_session_ws(run_id)
 
+    # Update marker immediately so the conversation poller skips this session
+    update_last_session_id(channel_id, thread_id, run_id)
+
     async with httpx.AsyncClient(timeout=30) as client:
         summary = await get_session_summary(client, conv_id, run_id)
 
@@ -472,9 +475,6 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
 
     for chunk in chunk_message(summary):
         await thread.send(chunk)
-
-    # Update marker so the conversation poller skips this session
-    update_last_session_id(channel_id, thread_id, run_id)
 
 
 async def _handle_dm(message: discord.Message) -> None:
@@ -530,6 +530,9 @@ async def _handle_dm(message: discord.Message) -> None:
 
     await wait_for_session_ws(run_id)
 
+    # Update marker immediately so the conversation poller skips this session
+    update_last_session_id(channel_id, "dm", run_id)
+
     async with httpx.AsyncClient(timeout=30) as client:
         summary = await get_session_summary(client, conv_id, run_id)
 
@@ -540,9 +543,6 @@ async def _handle_dm(message: discord.Message) -> None:
 
     for chunk in chunk_message(summary):
         await message.channel.send(chunk)
-
-    # Update marker so the conversation poller skips this session
-    update_last_session_id(channel_id, "dm", run_id)
 
 
 @bot.event

@@ -407,6 +407,9 @@ def handle_mention(event, say, context):
     # Wait for session to complete
     wait_for_session(run_id)
 
+    # Update marker immediately so the conversation poller skips this session
+    update_last_session_id(channel, thread_ts, run_id)
+
     summary = get_session_summary(conv_id, run_id)
 
     # Delete "On it..." and post summary
@@ -418,9 +421,6 @@ def handle_mention(event, say, context):
 
     for chunk in chunk_message(summary):
         say(text=chunk, thread_ts=thread_ts)
-
-    # Update marker so the conversation poller skips this session
-    update_last_session_id(channel, thread_ts, run_id)
 
 
 @app.event("message")
@@ -489,6 +489,9 @@ def handle_dm(event, say, context):
 
     wait_for_session(run_id)
 
+    # Update marker immediately so the conversation poller skips this session
+    update_last_session_id(channel, "dm", run_id)
+
     summary = get_session_summary(conv_id, run_id)
 
     if ack_ts:
@@ -499,9 +502,6 @@ def handle_dm(event, say, context):
 
     for chunk in chunk_message(summary):
         say(text=chunk, channel=channel)
-
-    # Update marker so the conversation poller skips this session
-    update_last_session_id(channel, "dm", run_id)
 
 
 # ---------------------------------------------------------------------------
