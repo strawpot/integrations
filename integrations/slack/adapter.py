@@ -85,6 +85,28 @@ def _init_db() -> sqlite3.Connection:
         )
     except sqlite3.OperationalError:
         pass  # Column already exists
+    # Map run_id → thread for routing poller responses to the correct thread
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_threads (
+            run_id      TEXT PRIMARY KEY,
+            channel_id  TEXT NOT NULL,
+            thread_ts   TEXT NOT NULL
+        )
+        """
+    )
+    # Pending replies: track thread_ts for queued tasks (no run_id yet)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_replies (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id  TEXT NOT NULL,
+            thread_ts   TEXT NOT NULL,
+            ack_ts      TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -152,6 +174,58 @@ def _get_latest_thread_ts(channel_id: str) -> str | None:
             (channel_id,),
         ).fetchone()
     return row[0] if row else None
+
+
+def _set_session_thread(run_id: str, channel_id: str, thread_ts: str) -> None:
+    """Record which thread a session was initiated from."""
+    with _db_lock:
+        db.execute(
+            "INSERT OR REPLACE INTO session_threads (run_id, channel_id, thread_ts) VALUES (?, ?, ?)",
+            (run_id, channel_id, thread_ts),
+        )
+        db.commit()
+
+
+def _get_session_thread(run_id: str) -> tuple[str, str] | None:
+    """Get the (channel_id, thread_ts) for a session."""
+    with _db_lock:
+        row = db.execute(
+            "SELECT channel_id, thread_ts FROM session_threads WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def _delete_session_thread(run_id: str) -> None:
+    """Clean up session thread mapping after delivery."""
+    with _db_lock:
+        db.execute("DELETE FROM session_threads WHERE run_id = ?", (run_id,))
+        db.commit()
+
+
+def _add_pending_reply(channel_id: str, thread_ts: str, ack_ts: str | None) -> None:
+    """Record a pending reply for a queued task."""
+    with _db_lock:
+        db.execute(
+            "INSERT INTO pending_replies (channel_id, thread_ts, ack_ts) VALUES (?, ?, ?)",
+            (channel_id, thread_ts, ack_ts),
+        )
+        db.commit()
+
+
+def _pop_pending_reply(channel_id: str) -> tuple[str, str | None] | None:
+    """Pop the oldest pending reply for a channel. Returns (thread_ts, ack_ts) or None."""
+    with _db_lock:
+        row = db.execute(
+            "SELECT id, thread_ts, ack_ts FROM pending_replies "
+            "WHERE channel_id = ? ORDER BY id ASC LIMIT 1",
+            (channel_id,),
+        ).fetchone()
+        if not row:
+            return None
+        db.execute("DELETE FROM pending_replies WHERE id = ?", (row[0],))
+        db.commit()
+    return (row[1], row[2])
 
 
 # ---------------------------------------------------------------------------
@@ -312,13 +386,30 @@ def _run_conversation_poller() -> None:
                                 session.get("summary")
                                 or f"Session {session['status']}."
                             )
-                            # For channel conversations, reply in the latest thread;
-                            # for DMs, post without thread_ts.
+                            # Route to the thread that initiated this session.
+                            # Priority: session_threads → pending_replies → latest_thread
                             reply_ts = None
+                            pending_ack_ts = None
                             if thread_ts == "channel":
-                                reply_ts = latest_thread
+                                st = _get_session_thread(session["run_id"])
+                                if st:
+                                    reply_ts = st[1]
+                                    _delete_session_thread(session["run_id"])
+                                else:
+                                    pr = _pop_pending_reply(channel_id)
+                                    if pr:
+                                        reply_ts = pr[0]
+                                        pending_ack_ts = pr[1]
+                                    else:
+                                        reply_ts = latest_thread
                             elif thread_ts != "dm":
                                 reply_ts = thread_ts
+                            # Delete queued-task ack message if present
+                            if pending_ack_ts:
+                                try:
+                                    app.client.chat_delete(channel=channel_id, ts=pending_ack_ts)
+                                except Exception:
+                                    pass
                             for chunk in chunk_message(summary):
                                 app.client.chat_postMessage(
                                     channel=channel_id,
@@ -438,17 +529,23 @@ def handle_mention(event, say, context):
                 app.client.chat_update(channel=channel, ts=ack_ts, text="Queued — will run after the current session finishes.")
             except Exception:
                 pass
+        # Record pending reply so the poller can deliver to the right thread
+        _add_pending_reply(channel, thread_ts, ack_ts)
         return
 
     run_id = result.get("run_id")
     if not run_id:
         return
 
+    # Record which thread this session belongs to (for poller fallback)
+    _set_session_thread(run_id, channel, thread_ts)
+
     # Wait for session to complete
     wait_for_session(run_id)
 
     # Update marker immediately so the conversation poller skips this session
     update_last_session_id(channel, "channel", run_id)
+    _delete_session_thread(run_id)
 
     summary = get_session_summary(conv_id, run_id)
 

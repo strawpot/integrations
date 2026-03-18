@@ -82,6 +82,16 @@ def _init_db() -> sqlite3.Connection:
         )
     except sqlite3.OperationalError:
         pass  # Column already exists
+    # Map run_id → thread for routing poller responses to the correct thread
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_threads (
+            run_id      TEXT PRIMARY KEY,
+            channel_id  TEXT NOT NULL,
+            thread_id   TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -131,6 +141,30 @@ def _update_latest_thread(channel_id: str, thread_id: str) -> None:
         "WHERE channel_id = ? AND thread_id = 'channel'",
         (thread_id, channel_id),
     )
+    db.commit()
+
+
+def _set_session_thread(run_id: str, channel_id: str, thread_id: str) -> None:
+    """Record which thread a session was initiated from."""
+    db.execute(
+        "INSERT OR REPLACE INTO session_threads (run_id, channel_id, thread_id) VALUES (?, ?, ?)",
+        (run_id, channel_id, thread_id),
+    )
+    db.commit()
+
+
+def _get_session_thread(run_id: str) -> tuple[str, str] | None:
+    """Get the (channel_id, thread_id) for a session."""
+    row = db.execute(
+        "SELECT channel_id, thread_id FROM session_threads WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def _delete_session_thread(run_id: str) -> None:
+    """Clean up session thread mapping after delivery."""
+    db.execute("DELETE FROM session_threads WHERE run_id = ?", (run_id,))
     db.commit()
 
 
@@ -294,14 +328,19 @@ async def conversation_poller() -> None:
                                     session.get("summary")
                                     or f"Session {session['status']}."
                                 )
-                                # Resolve destination channel/thread
+                                # Resolve destination: session_threads → latest_thread → channel
                                 dest = None
                                 if thread_id == "dm":
                                     dest_id = int(channel_id)
-                                elif thread_id == "channel" and latest_thread:
-                                    dest_id = int(latest_thread)
                                 elif thread_id == "channel":
-                                    dest_id = int(channel_id)
+                                    st = _get_session_thread(session["run_id"])
+                                    if st:
+                                        dest_id = int(st[1])
+                                        _delete_session_thread(session["run_id"])
+                                    elif latest_thread:
+                                        dest_id = int(latest_thread)
+                                    else:
+                                        dest_id = int(channel_id)
                                 else:
                                     dest_id = int(thread_id)
                                 dest = bot.get_channel(dest_id)
@@ -417,6 +456,8 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")
+            # Record thread so the poller can deliver to the right thread
+            _set_session_thread(f"pending:{channel_id}:{thread.id}", channel_id, str(thread.id))
             return
 
         run_id = result.get("run_id")
@@ -424,12 +465,16 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
             await ack.edit(content="Task submitted.")
             return
 
+    # Record which thread this session belongs to
+    _set_session_thread(run_id, channel_id, str(thread.id))
+
     # Wait for session to complete
     await wait_for_session_ws(run_id)
 
     # Update marker and track latest thread for poller replies
     update_last_session_id(channel_id, "channel", run_id)
     _update_latest_thread(channel_id, str(thread.id))
+    _delete_session_thread(run_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
         summary = await get_session_summary(client, conv_id, run_id)
@@ -475,6 +520,7 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")
+            _set_session_thread(f"pending:{channel_id}:{thread.id}", channel_id, str(thread.id))
             return
 
         run_id = result.get("run_id")
@@ -482,10 +528,12 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
             await ack.edit(content="Task submitted.")
             return
 
+    _set_session_thread(run_id, channel_id, str(thread.id))
     await wait_for_session_ws(run_id)
 
     update_last_session_id(channel_id, "channel", run_id)
     _update_latest_thread(channel_id, str(thread.id))
+    _delete_session_thread(run_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
         summary = await get_session_summary(client, conv_id, run_id)
