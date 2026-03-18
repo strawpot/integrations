@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -342,6 +343,60 @@ def _wait_for_session_poll(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def md_to_slack_mrkdwn(text: str) -> str:
+    """Convert common Markdown to Slack mrkdwn format.
+
+    Handles: fenced code blocks, inline code, bold, italic, strikethrough,
+    headings, links, and bullet lists.
+    """
+    # Fenced code blocks: ```lang\n...\n``` — Slack supports these natively
+    # but strip the language hint since Slack ignores it
+    text = re.sub(
+        r"```\w*\n(.*?)```",
+        lambda m: f"```\n{m.group(1)}```",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Protect inline code from further transformations
+    code_spans: list[str] = []
+
+    def _save_code(m: re.Match) -> str:
+        code_spans.append(m.group(0))
+        return f"\x00CODE{len(code_spans) - 1}\x00"
+
+    # Protect fenced blocks
+    text = re.sub(r"```.*?```", _save_code, text, flags=re.DOTALL)
+    # Protect inline code
+    text = re.sub(r"`[^`]+`", _save_code, text)
+
+    # Bold: **text** or __text__ → *text*
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"__(.+?)__", r"*\1*", text)
+
+    # Italic: _text_ → _text_ (already Slack-compatible)
+    # Single *text* that wasn't **bold** → _text_ for italic
+    # (skip this to avoid conflicts with Slack's *bold*)
+
+    # Strikethrough: ~~text~~ → ~text~
+    text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+
+    # Links: [text](url) → <url|text>
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+
+    # Headings: ### Title → *Title*
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+
+    # Bullet lists: leading "- " or "* " → "• "
+    text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
+
+    # Restore code spans
+    for i, code in enumerate(code_spans):
+        text = text.replace(f"\x00CODE{i}\x00", code)
+
+    return text
+
+
 def chunk_message(text: str, max_len: int = 39_000) -> list[str]:
     """Split text into chunks for Slack's message limit."""
     if len(text) <= max_len:
@@ -451,7 +506,7 @@ def _run_conversation_poller() -> None:
                                 app.client.chat_delete(channel=channel_id, ts=pending_ack_ts)
                             except Exception:
                                 pass
-                        for chunk in chunk_message(summary):
+                        for chunk in chunk_message(md_to_slack_mrkdwn(summary)):
                             app.client.chat_postMessage(
                                 channel=channel_id,
                                 thread_ts=reply_ts,
@@ -491,7 +546,7 @@ def _run_notification_poller() -> None:
                         logger.warning("Notification %d has no chat_id, skipping", nid)
                         continue
                     try:
-                        for chunk in chunk_message(message):
+                        for chunk in chunk_message(md_to_slack_mrkdwn(message)):
                             app.client.chat_postMessage(
                                 channel=chat_id,
                                 text=chunk,
@@ -597,7 +652,7 @@ def handle_mention(event, say, context):
         except Exception:
             pass
 
-    for chunk in chunk_message(summary):
+    for chunk in chunk_message(md_to_slack_mrkdwn(summary)):
         say(text=chunk, thread_ts=thread_ts)
 
 
@@ -678,7 +733,7 @@ def handle_dm(event, say, context):
         except Exception:
             pass
 
-    for chunk in chunk_message(summary):
+    for chunk in chunk_message(md_to_slack_mrkdwn(summary)):
         say(text=chunk, channel=channel)
 
 
