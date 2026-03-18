@@ -103,10 +103,16 @@ def _init_db() -> sqlite3.Connection:
             channel_id  TEXT NOT NULL,
             thread_ts   TEXT NOT NULL,
             ack_ts      TEXT,
+            run_id      TEXT,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )
+    # Migration: add run_id column for existing databases
+    try:
+        conn.execute("ALTER TABLE pending_replies ADD COLUMN run_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -213,19 +219,36 @@ def _add_pending_reply(channel_id: str, thread_ts: str, ack_ts: str | None) -> N
         db.commit()
 
 
-def _pop_pending_reply(channel_id: str) -> tuple[str, str | None] | None:
-    """Pop the oldest pending reply for a channel. Returns (thread_ts, ack_ts) or None."""
+def _assign_pending_reply(channel_id: str, run_id: str) -> bool:
+    """Assign a run_id to the oldest unassigned pending reply. Returns True if assigned."""
     with _db_lock:
         row = db.execute(
-            "SELECT id, thread_ts, ack_ts FROM pending_replies "
-            "WHERE channel_id = ? ORDER BY id ASC LIMIT 1",
+            "SELECT id FROM pending_replies "
+            "WHERE channel_id = ? AND run_id IS NULL ORDER BY id ASC LIMIT 1",
             (channel_id,),
+        ).fetchone()
+        if not row:
+            return False
+        db.execute(
+            "UPDATE pending_replies SET run_id = ? WHERE id = ?",
+            (run_id, row[0]),
+        )
+        db.commit()
+    return True
+
+
+def _pop_pending_reply_by_run_id(run_id: str) -> tuple[str, str, str | None] | None:
+    """Pop a pending reply by run_id. Returns (channel_id, thread_ts, ack_ts) or None."""
+    with _db_lock:
+        row = db.execute(
+            "SELECT id, channel_id, thread_ts, ack_ts FROM pending_replies WHERE run_id = ?",
+            (run_id,),
         ).fetchone()
         if not row:
             return None
         db.execute("DELETE FROM pending_replies WHERE id = ?", (row[0],))
         db.commit()
-    return (row[1], row[2])
+    return (row[1], row[2], row[3])
 
 
 # ---------------------------------------------------------------------------
@@ -370,55 +393,73 @@ def _run_conversation_poller() -> None:
                         )
                         continue
 
-                    # Find new completed sessions after the marker
+                    # Collect new sessions after the marker
                     found_marker = False
+                    new_sessions = []
                     for session in sessions:
                         if not found_marker:
                             if session["run_id"] == last_seen:
                                 found_marker = True
                             continue
-                        if session["status"] in (
+                        new_sessions.append(session)
+
+                    # Pass 1: assign pending_replies to running sessions
+                    # so we know which session belongs to which Slack thread
+                    if thread_ts == "channel":
+                        for session in new_sessions:
+                            if session["status"] == "running":
+                                if not _get_session_thread(session["run_id"]):
+                                    _assign_pending_reply(
+                                        channel_id, session["run_id"]
+                                    )
+
+                    # Pass 2: deliver completed sessions
+                    for session in new_sessions:
+                        if session["status"] not in (
                             "completed",
                             "failed",
                             "stopped",
                         ):
-                            summary = (
-                                session.get("summary")
-                                or f"Session {session['status']}."
-                            )
-                            # Route to the thread that initiated this session.
-                            # Priority: session_threads → pending_replies → latest_thread
-                            reply_ts = None
-                            pending_ack_ts = None
-                            if thread_ts == "channel":
-                                st = _get_session_thread(session["run_id"])
-                                if st:
-                                    reply_ts = st[1]
-                                    _delete_session_thread(session["run_id"])
-                                else:
-                                    pr = _pop_pending_reply(channel_id)
-                                    if pr:
-                                        reply_ts = pr[0]
-                                        pending_ack_ts = pr[1]
-                                    else:
-                                        reply_ts = latest_thread
-                            elif thread_ts != "dm":
-                                reply_ts = thread_ts
-                            # Delete queued-task ack message if present
-                            if pending_ack_ts:
-                                try:
-                                    app.client.chat_delete(channel=channel_id, ts=pending_ack_ts)
-                                except Exception:
-                                    pass
-                            for chunk in chunk_message(summary):
-                                app.client.chat_postMessage(
-                                    channel=channel_id,
-                                    thread_ts=reply_ts,
-                                    text=chunk,
+                            continue
+                        summary = (
+                            session.get("summary")
+                            or f"Session {session['status']}."
+                        )
+                        # Route to the thread that initiated this session.
+                        # Priority: session_threads → assigned pending_reply → latest_thread
+                        reply_ts = None
+                        pending_ack_ts = None
+                        if thread_ts == "channel":
+                            st = _get_session_thread(session["run_id"])
+                            if st:
+                                reply_ts = st[1]
+                                _delete_session_thread(session["run_id"])
+                            else:
+                                pr = _pop_pending_reply_by_run_id(
+                                    session["run_id"]
                                 )
-                            update_last_session_id(
-                                channel_id, thread_ts, session["run_id"]
+                                if pr:
+                                    reply_ts = pr[1]
+                                    pending_ack_ts = pr[2]
+                                else:
+                                    reply_ts = latest_thread
+                        elif thread_ts != "dm":
+                            reply_ts = thread_ts
+                        # Delete queued-task ack message if present
+                        if pending_ack_ts:
+                            try:
+                                app.client.chat_delete(channel=channel_id, ts=pending_ack_ts)
+                            except Exception:
+                                pass
+                        for chunk in chunk_message(summary):
+                            app.client.chat_postMessage(
+                                channel=channel_id,
+                                thread_ts=reply_ts,
+                                text=chunk,
                             )
+                        update_last_session_id(
+                            channel_id, thread_ts, session["run_id"]
+                        )
                 except Exception:
                     logger.debug("Poller error for conv %d", conv_id)
         except Exception:

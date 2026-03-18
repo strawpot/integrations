@@ -92,6 +92,19 @@ def _init_db() -> sqlite3.Connection:
         )
         """
     )
+    # Pending replies: track thread_id for queued tasks (no run_id yet)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_replies (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id  TEXT NOT NULL,
+            thread_id   TEXT NOT NULL,
+            ack_msg_id  TEXT,
+            run_id      TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -166,6 +179,45 @@ def _delete_session_thread(run_id: str) -> None:
     """Clean up session thread mapping after delivery."""
     db.execute("DELETE FROM session_threads WHERE run_id = ?", (run_id,))
     db.commit()
+
+
+def _add_pending_reply(channel_id: str, thread_id: str, ack_msg_id: str | None) -> None:
+    """Record a pending reply for a queued task."""
+    db.execute(
+        "INSERT INTO pending_replies (channel_id, thread_id, ack_msg_id) VALUES (?, ?, ?)",
+        (channel_id, thread_id, ack_msg_id),
+    )
+    db.commit()
+
+
+def _assign_pending_reply(channel_id: str, run_id: str) -> bool:
+    """Assign a run_id to the oldest unassigned pending reply. Returns True if assigned."""
+    row = db.execute(
+        "SELECT id FROM pending_replies "
+        "WHERE channel_id = ? AND run_id IS NULL ORDER BY id ASC LIMIT 1",
+        (channel_id,),
+    ).fetchone()
+    if not row:
+        return False
+    db.execute(
+        "UPDATE pending_replies SET run_id = ? WHERE id = ?",
+        (run_id, row[0]),
+    )
+    db.commit()
+    return True
+
+
+def _pop_pending_reply_by_run_id(run_id: str) -> tuple[str, str, str | None] | None:
+    """Pop a pending reply by run_id. Returns (channel_id, thread_id, ack_msg_id) or None."""
+    row = db.execute(
+        "SELECT id, channel_id, thread_id, ack_msg_id FROM pending_replies WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return None
+    db.execute("DELETE FROM pending_replies WHERE id = ?", (row[0],))
+    db.commit()
+    return (row[1], row[2], row[3])
 
 
 # ---------------------------------------------------------------------------
@@ -312,50 +364,80 @@ async def conversation_poller() -> None:
                             )
                             continue
 
-                        # Find new completed sessions after the marker
+                        # Collect new sessions after the marker
                         found_marker = False
+                        new_sessions = []
                         for session in sessions:
                             if not found_marker:
                                 if session["run_id"] == last_seen:
                                     found_marker = True
                                 continue
-                            if session["status"] in (
+                            new_sessions.append(session)
+
+                        # Pass 1: assign pending_replies to running sessions
+                        if thread_id == "channel":
+                            for session in new_sessions:
+                                if session["status"] == "running":
+                                    if not _get_session_thread(session["run_id"]):
+                                        _assign_pending_reply(
+                                            channel_id, session["run_id"]
+                                        )
+
+                        # Pass 2: deliver completed sessions
+                        for session in new_sessions:
+                            if session["status"] not in (
                                 "completed",
                                 "failed",
                                 "stopped",
                             ):
-                                summary = (
-                                    session.get("summary")
-                                    or f"Session {session['status']}."
-                                )
-                                # Resolve destination: session_threads → latest_thread → channel
-                                dest = None
-                                if thread_id == "dm":
-                                    dest_id = int(channel_id)
-                                elif thread_id == "channel":
-                                    st = _get_session_thread(session["run_id"])
-                                    if st:
-                                        dest_id = int(st[1])
-                                        _delete_session_thread(session["run_id"])
+                                continue
+                            summary = (
+                                session.get("summary")
+                                or f"Session {session['status']}."
+                            )
+                            # Resolve destination: session_threads → assigned pending_reply → latest_thread → channel
+                            dest_id = None
+                            ack_msg_id = None
+                            if thread_id == "dm":
+                                dest_id = int(channel_id)
+                            elif thread_id == "channel":
+                                st = _get_session_thread(session["run_id"])
+                                if st:
+                                    dest_id = int(st[1])
+                                    _delete_session_thread(session["run_id"])
+                                else:
+                                    pr = _pop_pending_reply_by_run_id(
+                                        session["run_id"]
+                                    )
+                                    if pr:
+                                        dest_id = int(pr[1])
+                                        ack_msg_id = pr[2]
                                     elif latest_thread:
                                         dest_id = int(latest_thread)
                                     else:
                                         dest_id = int(channel_id)
-                                else:
-                                    dest_id = int(thread_id)
-                                dest = bot.get_channel(dest_id)
-                                if dest is None:
-                                    try:
-                                        dest = await bot.fetch_channel(dest_id)
-                                    except Exception:
-                                        continue
-                                for chunk_text in chunk_message(summary):
-                                    await dest.send(chunk_text)
-                                update_last_session_id(
-                                    channel_id,
-                                    thread_id,
-                                    session["run_id"],
-                                )
+                            else:
+                                dest_id = int(thread_id)
+                            dest = bot.get_channel(dest_id)
+                            if dest is None:
+                                try:
+                                    dest = await bot.fetch_channel(dest_id)
+                                except Exception:
+                                    continue
+                            # Delete queued-task ack message if present
+                            if ack_msg_id:
+                                try:
+                                    ack_msg = await dest.fetch_message(int(ack_msg_id))
+                                    await ack_msg.delete()
+                                except Exception:
+                                    pass
+                            for chunk_text in chunk_message(summary):
+                                await dest.send(chunk_text)
+                            update_last_session_id(
+                                channel_id,
+                                thread_id,
+                                session["run_id"],
+                            )
                     except Exception:
                         logger.debug("Poller error for conv %d", conv_id)
             except Exception:
@@ -456,8 +538,7 @@ async def _handle_channel_mention(message: discord.Message, text: str) -> None:
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")
-            # Record thread so the poller can deliver to the right thread
-            _set_session_thread(f"pending:{channel_id}:{thread.id}", channel_id, str(thread.id))
+            _add_pending_reply(channel_id, str(thread.id), str(ack.id))
             return
 
         run_id = result.get("run_id")
@@ -520,7 +601,7 @@ async def _handle_thread_reply(message: discord.Message, text: str) -> None:
 
         if result.get("queued"):
             await ack.edit(content="Queued — will run after the current session finishes.")
-            _set_session_thread(f"pending:{channel_id}:{thread.id}", channel_id, str(thread.id))
+            _add_pending_reply(channel_id, str(thread.id), str(ack.id))
             return
 
         run_id = result.get("run_id")
