@@ -745,11 +745,9 @@ def main() -> None:
     logger.info("Starting Discord adapter")
     logger.info("API URL: %s", API_URL)
 
-    loop = asyncio.new_event_loop()
-
     def handle_sigterm(signum, frame):
         logger.info("Received SIGTERM, shutting down...")
-        loop.create_task(bot.close())
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
