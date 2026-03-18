@@ -339,110 +339,113 @@ def chunk_message(text: str) -> list[str]:
 async def conversation_poller() -> None:
     """Poll watched conversations and relay new completed sessions to Discord."""
     await bot.wait_until_ready()
-    async with httpx.AsyncClient(timeout=30) as client:
-        while not bot.is_closed():
-            try:
-                rows = db.execute(
-                    "SELECT channel_id, thread_id, conv_id, last_session_id, latest_thread_id "
-                    "FROM thread_conversations"
-                ).fetchall()
-                for channel_id, thread_id, conv_id, last_seen, latest_thread in rows:
-                    try:
-                        resp = await client.get(
-                            f"{API_URL}/api/conversations/{conv_id}"
-                        )
-                        if resp.status_code != 200:
-                            continue
-                        sessions = resp.json().get("sessions", [])
-                        if not sessions:
-                            continue
-
-                        # If no marker yet, initialize to latest without delivering
-                        if last_seen is None:
-                            update_last_session_id(
-                                channel_id, thread_id, sessions[-1]["run_id"]
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            while not bot.is_closed():
+                try:
+                    rows = db.execute(
+                        "SELECT channel_id, thread_id, conv_id, last_session_id, latest_thread_id "
+                        "FROM thread_conversations"
+                    ).fetchall()
+                    for channel_id, thread_id, conv_id, last_seen, latest_thread in rows:
+                        try:
+                            resp = await client.get(
+                                f"{API_URL}/api/conversations/{conv_id}"
                             )
-                            continue
-
-                        # Collect new sessions after the marker
-                        found_marker = False
-                        new_sessions = []
-                        for session in sessions:
-                            if not found_marker:
-                                if session["run_id"] == last_seen:
-                                    found_marker = True
+                            if resp.status_code != 200:
                                 continue
-                            new_sessions.append(session)
-
-                        # Pass 1: assign pending_replies to running sessions
-                        if thread_id == "channel":
-                            for session in new_sessions:
-                                if session["status"] == "running":
-                                    if not _get_session_thread(session["run_id"]):
-                                        _assign_pending_reply(
-                                            channel_id, session["run_id"]
-                                        )
-
-                        # Pass 2: deliver completed sessions
-                        for session in new_sessions:
-                            if session["status"] not in (
-                                "completed",
-                                "failed",
-                                "stopped",
-                            ):
+                            sessions = resp.json().get("sessions", [])
+                            if not sessions:
                                 continue
-                            summary = (
-                                session.get("summary")
-                                or f"Session {session['status']}."
-                            )
-                            # Resolve destination: session_threads → assigned pending_reply → latest_thread → channel
-                            dest_id = None
-                            ack_msg_id = None
-                            if thread_id == "dm":
-                                dest_id = int(channel_id)
-                            elif thread_id == "channel":
-                                st = _get_session_thread(session["run_id"])
-                                if st:
-                                    dest_id = int(st[1])
-                                    _delete_session_thread(session["run_id"])
-                                else:
-                                    pr = _pop_pending_reply_by_run_id(
-                                        session["run_id"]
-                                    )
-                                    if pr:
-                                        dest_id = int(pr[1])
-                                        ack_msg_id = pr[2]
-                                    elif latest_thread:
-                                        dest_id = int(latest_thread)
-                                    else:
-                                        dest_id = int(channel_id)
-                            else:
-                                dest_id = int(thread_id)
-                            dest = bot.get_channel(dest_id)
-                            if dest is None:
-                                try:
-                                    dest = await bot.fetch_channel(dest_id)
-                                except Exception:
+
+                            # If no marker yet, initialize to latest without delivering
+                            if last_seen is None:
+                                update_last_session_id(
+                                    channel_id, thread_id, sessions[-1]["run_id"]
+                                )
+                                continue
+
+                            # Collect new sessions after the marker
+                            found_marker = False
+                            new_sessions = []
+                            for session in sessions:
+                                if not found_marker:
+                                    if session["run_id"] == last_seen:
+                                        found_marker = True
                                     continue
-                            # Delete queued-task ack message if present
-                            if ack_msg_id:
-                                try:
-                                    ack_msg = await dest.fetch_message(int(ack_msg_id))
-                                    await ack_msg.delete()
-                                except Exception:
-                                    pass
-                            for chunk_text in chunk_message(summary):
-                                await dest.send(chunk_text)
-                            update_last_session_id(
-                                channel_id,
-                                thread_id,
-                                session["run_id"],
-                            )
-                    except Exception:
-                        logger.debug("Poller error for conv %d", conv_id)
-            except Exception:
-                logger.exception("Conversation poller error")
-            await asyncio.sleep(CONV_POLL_INTERVAL)
+                                new_sessions.append(session)
+
+                            # Pass 1: assign pending_replies to running sessions
+                            if thread_id == "channel":
+                                for session in new_sessions:
+                                    if session["status"] == "running":
+                                        if not _get_session_thread(session["run_id"]):
+                                            _assign_pending_reply(
+                                                channel_id, session["run_id"]
+                                            )
+
+                            # Pass 2: deliver completed sessions
+                            for session in new_sessions:
+                                if session["status"] not in (
+                                    "completed",
+                                    "failed",
+                                    "stopped",
+                                ):
+                                    continue
+                                summary = (
+                                    session.get("summary")
+                                    or f"Session {session['status']}."
+                                )
+                                # Resolve destination: session_threads → assigned pending_reply → latest_thread → channel
+                                dest_id = None
+                                ack_msg_id = None
+                                if thread_id == "dm":
+                                    dest_id = int(channel_id)
+                                elif thread_id == "channel":
+                                    st = _get_session_thread(session["run_id"])
+                                    if st:
+                                        dest_id = int(st[1])
+                                        _delete_session_thread(session["run_id"])
+                                    else:
+                                        pr = _pop_pending_reply_by_run_id(
+                                            session["run_id"]
+                                        )
+                                        if pr:
+                                            dest_id = int(pr[1])
+                                            ack_msg_id = pr[2]
+                                        elif latest_thread:
+                                            dest_id = int(latest_thread)
+                                        else:
+                                            dest_id = int(channel_id)
+                                else:
+                                    dest_id = int(thread_id)
+                                dest = bot.get_channel(dest_id)
+                                if dest is None:
+                                    try:
+                                        dest = await bot.fetch_channel(dest_id)
+                                    except Exception:
+                                        continue
+                                # Delete queued-task ack message if present
+                                if ack_msg_id:
+                                    try:
+                                        ack_msg = await dest.fetch_message(int(ack_msg_id))
+                                        await ack_msg.delete()
+                                    except Exception:
+                                        pass
+                                for chunk_text in chunk_message(summary):
+                                    await dest.send(chunk_text)
+                                update_last_session_id(
+                                    channel_id,
+                                    thread_id,
+                                    session["run_id"],
+                                )
+                        except Exception:
+                            logger.debug("Poller error for conv %d", conv_id)
+                except Exception:
+                    logger.exception("Conversation poller error")
+                await asyncio.sleep(CONV_POLL_INTERVAL)
+    except asyncio.CancelledError:
+        logger.debug("Conversation poller cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -453,39 +456,42 @@ async def conversation_poller() -> None:
 async def notification_poller() -> None:
     """Poll for pending notifications and deliver them to Discord channels."""
     await bot.wait_until_ready()
-    async with httpx.AsyncClient(timeout=30) as client:
-        while not bot.is_closed():
-            try:
-                resp = await client.get(
-                    f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications"
-                )
-                if resp.status_code == 200:
-                    for item in resp.json():
-                        chat_id = item.get("chat_id")
-                        message = item.get("message", "")
-                        nid = item["id"]
-                        if not chat_id:
-                            logger.warning("Notification %d has no chat_id, skipping", nid)
-                            continue
-                        try:
-                            dest = bot.get_channel(int(chat_id))
-                            if dest is None:
-                                dest = await bot.fetch_channel(int(chat_id))
-                            for chunk_text in chunk_message(message):
-                                await dest.send(chunk_text)
-                            # ACK after successful delivery
-                            await client.post(
-                                f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
-                                f"/notifications/{nid}/ack"
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to deliver notification %d to channel %s",
-                                nid, chat_id,
-                            )
-            except Exception:
-                logger.debug("Notification poller error")
-            await asyncio.sleep(NOTIFY_POLL_INTERVAL)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            while not bot.is_closed():
+                try:
+                    resp = await client.get(
+                        f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications"
+                    )
+                    if resp.status_code == 200:
+                        for item in resp.json():
+                            chat_id = item.get("chat_id")
+                            message = item.get("message", "")
+                            nid = item["id"]
+                            if not chat_id:
+                                logger.warning("Notification %d has no chat_id, skipping", nid)
+                                continue
+                            try:
+                                dest = bot.get_channel(int(chat_id))
+                                if dest is None:
+                                    dest = await bot.fetch_channel(int(chat_id))
+                                for chunk_text in chunk_message(message):
+                                    await dest.send(chunk_text)
+                                # ACK after successful delivery
+                                await client.post(
+                                    f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
+                                    f"/notifications/{nid}/ack"
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to deliver notification %d to channel %s",
+                                    nid, chat_id,
+                                )
+                except Exception:
+                    logger.debug("Notification poller error")
+                await asyncio.sleep(NOTIFY_POLL_INTERVAL)
+    except asyncio.CancelledError:
+        logger.debug("Notification poller cancelled")
 
 
 # ---------------------------------------------------------------------------

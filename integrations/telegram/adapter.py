@@ -283,69 +283,72 @@ def chunk_message(text: str) -> list[str]:
 async def conversation_poller(application) -> None:
     """Poll watched conversations and relay new completed sessions to Telegram."""
     bot_instance = application.bot
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            try:
-                rows = db.execute(
-                    "SELECT chat_id, conv_id, last_session_id "
-                    "FROM chat_conversations"
-                ).fetchall()
-                for chat_id, conv_id, last_seen in rows:
-                    try:
-                        resp = await client.get(
-                            f"{API_URL}/api/conversations/{conv_id}"
-                        )
-                        if resp.status_code != 200:
-                            continue
-                        sessions = resp.json().get("sessions", [])
-                        if not sessions:
-                            continue
-
-                        # If no marker yet, initialize to latest without delivering
-                        if last_seen is None:
-                            update_last_session_id(
-                                chat_id, sessions[-1]["run_id"]
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                try:
+                    rows = db.execute(
+                        "SELECT chat_id, conv_id, last_session_id "
+                        "FROM chat_conversations"
+                    ).fetchall()
+                    for chat_id, conv_id, last_seen in rows:
+                        try:
+                            resp = await client.get(
+                                f"{API_URL}/api/conversations/{conv_id}"
                             )
-                            continue
-
-                        # Find new completed sessions after the marker
-                        found_marker = False
-                        for session in sessions:
-                            if not found_marker:
-                                if session["run_id"] == last_seen:
-                                    found_marker = True
+                            if resp.status_code != 200:
                                 continue
-                            if session["status"] in (
-                                "completed",
-                                "failed",
-                                "stopped",
-                            ):
-                                summary = (
-                                    session.get("summary")
-                                    or f"Session {session['status']}."
-                                )
-                                html_summary = md_to_telegram_html(summary)
-                                for chunk in chunk_message(html_summary):
-                                    try:
-                                        await bot_instance.send_message(
-                                            chat_id=int(chat_id),
-                                            text=chunk,
-                                            parse_mode=ParseMode.HTML,
-                                        )
-                                    except Exception:
-                                        await bot_instance.send_message(
-                                            chat_id=int(chat_id),
-                                            text=summary[:TG_MAX_LEN],
-                                        )
-                                        break
+                            sessions = resp.json().get("sessions", [])
+                            if not sessions:
+                                continue
+
+                            # If no marker yet, initialize to latest without delivering
+                            if last_seen is None:
                                 update_last_session_id(
-                                    chat_id, session["run_id"]
+                                    chat_id, sessions[-1]["run_id"]
                                 )
-                    except Exception:
-                        logger.debug("Poller error for conv %d", conv_id)
-            except Exception:
-                logger.exception("Conversation poller error")
-            await asyncio.sleep(CONV_POLL_INTERVAL)
+                                continue
+
+                            # Find new completed sessions after the marker
+                            found_marker = False
+                            for session in sessions:
+                                if not found_marker:
+                                    if session["run_id"] == last_seen:
+                                        found_marker = True
+                                    continue
+                                if session["status"] in (
+                                    "completed",
+                                    "failed",
+                                    "stopped",
+                                ):
+                                    summary = (
+                                        session.get("summary")
+                                        or f"Session {session['status']}."
+                                    )
+                                    html_summary = md_to_telegram_html(summary)
+                                    for chunk in chunk_message(html_summary):
+                                        try:
+                                            await bot_instance.send_message(
+                                                chat_id=int(chat_id),
+                                                text=chunk,
+                                                parse_mode=ParseMode.HTML,
+                                            )
+                                        except Exception:
+                                            await bot_instance.send_message(
+                                                chat_id=int(chat_id),
+                                                text=summary[:TG_MAX_LEN],
+                                            )
+                                            break
+                                    update_last_session_id(
+                                        chat_id, session["run_id"]
+                                    )
+                        except Exception:
+                            logger.debug("Poller error for conv %d", conv_id)
+                except Exception:
+                    logger.exception("Conversation poller error")
+                await asyncio.sleep(CONV_POLL_INTERVAL)
+    except asyncio.CancelledError:
+        logger.debug("Conversation poller cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -356,49 +359,52 @@ async def conversation_poller(application) -> None:
 async def notification_poller(application) -> None:
     """Poll for pending notifications and deliver them to Telegram chats."""
     bot_instance = application.bot
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            try:
-                resp = await client.get(
-                    f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications"
-                )
-                if resp.status_code == 200:
-                    for item in resp.json():
-                        chat_id = item.get("chat_id")
-                        message = item.get("message", "")
-                        nid = item["id"]
-                        if not chat_id:
-                            logger.warning("Notification %d has no chat_id, skipping", nid)
-                            continue
-                        try:
-                            html_msg = md_to_telegram_html(message)
-                            for chunk in chunk_message(html_msg):
-                                try:
-                                    await bot_instance.send_message(
-                                        chat_id=int(chat_id),
-                                        text=chunk,
-                                        parse_mode=ParseMode.HTML,
-                                    )
-                                except Exception:
-                                    # Fallback to plain text
-                                    await bot_instance.send_message(
-                                        chat_id=int(chat_id),
-                                        text=message[:TG_MAX_LEN],
-                                    )
-                                    break
-                            # ACK after successful delivery
-                            await client.post(
-                                f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
-                                f"/notifications/{nid}/ack"
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to deliver notification %d to chat %s",
-                                nid, chat_id,
-                            )
-            except Exception:
-                logger.debug("Notification poller error")
-            await asyncio.sleep(NOTIFY_POLL_INTERVAL)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                try:
+                    resp = await client.get(
+                        f"{API_URL}/api/integrations/{INTEGRATION_NAME}/notifications"
+                    )
+                    if resp.status_code == 200:
+                        for item in resp.json():
+                            chat_id = item.get("chat_id")
+                            message = item.get("message", "")
+                            nid = item["id"]
+                            if not chat_id:
+                                logger.warning("Notification %d has no chat_id, skipping", nid)
+                                continue
+                            try:
+                                html_msg = md_to_telegram_html(message)
+                                for chunk in chunk_message(html_msg):
+                                    try:
+                                        await bot_instance.send_message(
+                                            chat_id=int(chat_id),
+                                            text=chunk,
+                                            parse_mode=ParseMode.HTML,
+                                        )
+                                    except Exception:
+                                        # Fallback to plain text
+                                        await bot_instance.send_message(
+                                            chat_id=int(chat_id),
+                                            text=message[:TG_MAX_LEN],
+                                        )
+                                        break
+                                # ACK after successful delivery
+                                await client.post(
+                                    f"{API_URL}/api/integrations/{INTEGRATION_NAME}"
+                                    f"/notifications/{nid}/ack"
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to deliver notification %d to chat %s",
+                                    nid, chat_id,
+                                )
+                except Exception:
+                    logger.debug("Notification poller error")
+                await asyncio.sleep(NOTIFY_POLL_INTERVAL)
+    except asyncio.CancelledError:
+        logger.debug("Notification poller cancelled")
 
 
 # ---------------------------------------------------------------------------
