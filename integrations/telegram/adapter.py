@@ -29,6 +29,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("strawpot.telegram")
 
+# Suppress noisy httpx request logging (pollers every few seconds)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
