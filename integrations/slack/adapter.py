@@ -22,6 +22,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("strawpot.slack")
 
+# Suppress noisy httpx request logging (notification poller every 5s)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -75,6 +78,13 @@ def _init_db() -> sqlite3.Connection:
         )
     except sqlite3.OperationalError:
         pass  # Column already exists
+    # Migration: add latest_thread_ts for channel-level conversation mapping
+    try:
+        conn.execute(
+            "ALTER TABLE thread_conversations ADD COLUMN latest_thread_ts TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -120,6 +130,28 @@ def update_last_session_id(channel_id: str, thread_ts: str, run_id: str) -> None
             (run_id, channel_id, thread_ts),
         )
         db.commit()
+
+
+def _update_thread_ts(channel_id: str, thread_ts: str) -> None:
+    """Track the latest thread_ts for a channel conversation (for reply targeting)."""
+    with _db_lock:
+        db.execute(
+            "UPDATE thread_conversations SET latest_thread_ts = ? "
+            "WHERE channel_id = ? AND thread_ts = 'channel'",
+            (thread_ts, channel_id),
+        )
+        db.commit()
+
+
+def _get_latest_thread_ts(channel_id: str) -> str | None:
+    """Get the latest thread_ts for reply targeting."""
+    with _db_lock:
+        row = db.execute(
+            "SELECT latest_thread_ts FROM thread_conversations "
+            "WHERE channel_id = ? AND thread_ts = 'channel'",
+            (channel_id,),
+        ).fetchone()
+    return row[0] if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +275,10 @@ def _run_conversation_poller() -> None:
         try:
             with _db_lock:
                 rows = db.execute(
-                    "SELECT channel_id, thread_ts, conv_id, last_session_id "
+                    "SELECT channel_id, thread_ts, conv_id, last_session_id, latest_thread_ts "
                     "FROM thread_conversations"
                 ).fetchall()
-            for channel_id, thread_ts, conv_id, last_seen in rows:
+            for channel_id, thread_ts, conv_id, last_seen, latest_thread in rows:
                 try:
                     resp = httpx.get(
                         f"{API_URL}/api/conversations/{conv_id}", timeout=30
@@ -280,12 +312,17 @@ def _run_conversation_poller() -> None:
                                 session.get("summary")
                                 or f"Session {session['status']}."
                             )
+                            # For channel conversations, reply in the latest thread;
+                            # for DMs, post without thread_ts.
+                            reply_ts = None
+                            if thread_ts == "channel":
+                                reply_ts = latest_thread
+                            elif thread_ts != "dm":
+                                reply_ts = thread_ts
                             for chunk in chunk_message(summary):
                                 app.client.chat_postMessage(
                                     channel=channel_id,
-                                    thread_ts=thread_ts
-                                    if thread_ts != "dm"
-                                    else None,
+                                    thread_ts=reply_ts,
                                     text=chunk,
                                 )
                             update_last_session_id(
@@ -357,13 +394,13 @@ def _strip_mention(text: str, bot_user_id: str) -> str:
 
 @app.event("app_mention")
 def handle_mention(event, say, context):
-    """Handle @mention in a channel — create/continue thread conversation."""
+    """Handle @mention in a channel — all mentions in the same channel share one conversation."""
     channel = event["channel"]
     user_text = _strip_mention(event.get("text", ""), context.get("bot_user_id", ""))
     if not user_text:
         return
 
-    # Use existing thread or start a new one from this message
+    # Reply in the thread where the mention happened
     thread_ts = event.get("thread_ts") or event["ts"]
 
     logger.info("Mention in %s (thread %s): %s", channel, thread_ts, user_text[:100])
@@ -372,15 +409,18 @@ def handle_mention(event, say, context):
     ack_resp = say(text="On it...", thread_ts=thread_ts)
     ack_ts = ack_resp.get("ts") if isinstance(ack_resp, dict) else None
 
-    conv_id = get_or_create_conversation(channel, thread_ts)
+    # Map the entire channel to one conversation (use "channel" as the key)
+    conv_id = get_or_create_conversation(channel, "channel")
+    # Track latest thread for reply targeting by the conversation poller
+    _update_thread_ts(channel, thread_ts)
 
     try:
         result = submit_task(conv_id, user_text)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
-            logger.warning("Conversation %d deleted, creating new one for %s/%s", conv_id, channel, thread_ts)
-            clear_conv_id(channel, thread_ts)
-            conv_id = get_or_create_conversation(channel, thread_ts)
+            logger.warning("Conversation %d deleted, creating new one for %s", conv_id, channel)
+            clear_conv_id(channel, "channel")
+            conv_id = get_or_create_conversation(channel, "channel")
             try:
                 result = submit_task(conv_id, user_text)
             except httpx.HTTPStatusError as exc2:
@@ -408,7 +448,7 @@ def handle_mention(event, say, context):
     wait_for_session(run_id)
 
     # Update marker immediately so the conversation poller skips this session
-    update_last_session_id(channel, thread_ts, run_id)
+    update_last_session_id(channel, "channel", run_id)
 
     summary = get_session_summary(conv_id, run_id)
 
