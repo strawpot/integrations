@@ -33,6 +33,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 API_URL = os.environ.get("STRAWPOT_API_URL", "http://127.0.0.1:52532")
 BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
 APP_TOKEN = os.environ.get("STRAWPOT_APP_TOKEN", "")
+PROJECT_ID: int | None = (
+    int(os.environ["STRAWPOT_PROJECT_ID"])
+    if os.environ.get("STRAWPOT_PROJECT_ID")
+    else None
+)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "3"))
 # How often to poll conversations for new sessions from other sources (seconds)
 CONV_POLL_INTERVAL = int(os.environ.get("CONV_POLL_INTERVAL", "10"))
@@ -258,8 +263,20 @@ def _pop_pending_reply_by_run_id(run_id: str) -> tuple[str, str, str | None] | N
 
 
 def create_conversation() -> int:
-    """Create a new imu conversation and return its ID."""
-    resp = httpx.post(f"{API_URL}/api/imu/conversations", timeout=30)
+    """Create a conversation and return its ID.
+
+    When running project-scoped (STRAWPOT_PROJECT_ID is set), creates in that
+    project via the general conversations endpoint.  Otherwise falls back to
+    the imu-specific endpoint (project_id=0).
+    """
+    if PROJECT_ID is not None:
+        resp = httpx.post(
+            f"{API_URL}/api/conversations",
+            json={"project_id": PROJECT_ID},
+            timeout=30,
+        )
+    else:
+        resp = httpx.post(f"{API_URL}/api/imu/conversations", timeout=30)
     resp.raise_for_status()
     return resp.json()["id"]
 
@@ -745,6 +762,8 @@ def handle_dm(event, say, context):
 def main() -> None:
     logger.info("Starting Slack adapter (Socket Mode)")
     logger.info("API URL: %s", API_URL)
+    if PROJECT_ID is not None:
+        logger.info("Project-scoped: project_id=%d", PROJECT_ID)
 
     # Start background pollers in daemon threads
     poller_thread = threading.Thread(

@@ -38,6 +38,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API_URL = os.environ.get("STRAWPOT_API_URL", "http://127.0.0.1:52532")
 BOT_TOKEN = os.environ.get("STRAWPOT_BOT_TOKEN", "")
+PROJECT_ID: int | None = (
+    int(os.environ["STRAWPOT_PROJECT_ID"])
+    if os.environ.get("STRAWPOT_PROJECT_ID")
+    else None
+)
 # Max chars per Telegram message (leave room for formatting)
 TG_MAX_LEN = int(os.environ.get("TG_MAX_LEN", "4000"))
 # How often to poll for session status if WebSocket fails (seconds)
@@ -126,8 +131,19 @@ def update_last_session_id(chat_id: str, run_id: str) -> None:
 
 
 async def create_conversation(client: httpx.AsyncClient) -> int:
-    """Create a new imu conversation and return its ID."""
-    resp = await client.post(f"{API_URL}/api/imu/conversations")
+    """Create a conversation and return its ID.
+
+    When running project-scoped (STRAWPOT_PROJECT_ID is set), creates in that
+    project via the general conversations endpoint.  Otherwise falls back to
+    the imu-specific endpoint (project_id=0).
+    """
+    if PROJECT_ID is not None:
+        resp = await client.post(
+            f"{API_URL}/api/conversations",
+            json={"project_id": PROJECT_ID},
+        )
+    else:
+        resp = await client.post(f"{API_URL}/api/imu/conversations")
     resp.raise_for_status()
     return resp.json()["id"]
 
@@ -527,6 +543,8 @@ async def _post_init(application) -> None:
 def main() -> None:
     logger.info("Starting Telegram adapter")
     logger.info("API URL: %s", API_URL)
+    if PROJECT_ID is not None:
+        logger.info("Project-scoped: project_id=%d", PROJECT_ID)
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
